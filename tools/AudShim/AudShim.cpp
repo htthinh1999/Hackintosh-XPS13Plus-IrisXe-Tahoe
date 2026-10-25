@@ -212,6 +212,8 @@ static void pollStep(uint32_t elapsedUs) {
 #define AUD_SPK_NDAI       (AUD_SPK_LINK_LAST - AUD_SPK_LINK_FIRST + 1)
 #define AUD_SPK_RXSEL(l)   (0u)               // UCM rt1316.conf, 1 amp: 'L,R' = index 0. XPS: l == 1 ? 1 ('L,L') : 5 ('R,R')
 #define AUD_EMPTY_LINK     2u                 // XPS: 3
+#define AUD_MIC_LINK       3u                 // RT714 (rt715-sdca). XPS: 0
+#define AUD_MIC_MASK       (1u << AUD_MIC_LINK)   // capture bank-switch link mask. XPS: 0x1
 
 enum {
     kAudShimInfo = 0,       // out: 16 x uint64 (see sInfo)
@@ -526,7 +528,7 @@ public:
     IODMACommand *m7Cmd = nullptr;
     uint8_t *m7Va = nullptr;
     uint64_t m7Iova = 0, m7Phys = 0;
-    uint32_t micDev = 0;                       // RT714 device number on link 0 (set by the enumeration, 0 = none)
+    uint32_t micDev = 0;                       // RT714 device number on AUD_MIC_LINK (set by the enumeration, 0 = none)
     uint32_t micHwVer = 0xFF;
     bool micInit = false, capTopo = false;
     AudShimUserClient *capClient = nullptr;    // connection that runs the capture (not retained)
@@ -2719,8 +2721,8 @@ bool AudShim::m5IpcCheck(uint8_t *m, uint32_t len, const char **why) {
     case 0x80000000u: {  // SOF_IPC_GLB_DAI_MSG
         if (typ != 0x00010000u || len != 216) return false;   // DAI_CONFIG
         uint32_t t = *(uint32_t *)(m + 8), idx = *(uint32_t *)(m + 12);
-        *why = "DAI_CONFIG for something else than ALH 0x100/0x200/0x0";
-        return t == 4 && (idx == 0x100 || idx == 0x200 || idx == 0x000);   // M7: 0x0 = link 0 PDI 2 (RT714)
+        *why = "DAI_CONFIG for something else than the speaker / microphone ALH DAIs";
+        return t == 4 && (idx == 0x100 || idx == 0x200 || idx == (AUD_MIC_LINK << 8));   // M7: mic link PDI 2 (RT714)
     }
     case 0x60000000u:   // SOF_IPC_GLB_STREAM_MSG
         if (typ == 0x00030000u || typ == 0x00040000u || typ == 0x00050000u) {   // PCM_FREE TRIG_START TRIG_STOP
@@ -2878,24 +2880,24 @@ uint32_t AudShim::m5Rollback() {
         m5Flags &= ~kF5Amp;
     }
     // M7: RT714 back to PS3 with FU02 muted (DAPM PRE_PMD + UCM DisableSequence), link 0 port 2 channels off
-    if ((m5Flags & kF5Mic) && micDev && m4Step[0] == kLRun && m4LinkPowered(0)) {
+    if ((m5Flags & kF5Mic) && micDev && m4Step[AUD_MIC_LINK] == kLRun && m4LinkPowered(AUD_MIC_LINK)) {
         for (uint32_t i = 0; i < sizeof kDrvMicOps / sizeof kDrvMicOps[0]; i++) {
             const AudDrvMicOp &mo = kDrvMicOps[i];
             if (mo.phase != 4 || (mo.kind != 1 && mo.kind != 2)) continue;
             uint64_t o[16] = {};
             uint32_t val = mo.val;
             if (mo.kind == 2) {   // update: read, then write
-                if (m5Xfer(0, 2, micDev, mo.reg, 1, 0, 50000, o) || !(o[3] & kRespACK)) { rc |= 2; continue; }
+                if (m5Xfer(AUD_MIC_LINK, 2, micDev, mo.reg, 1, 0, 50000, o) || !(o[3] & kRespACK)) { rc |= 2; continue; }
                 val = (((uint32_t)(o[3] >> 8) & 0xFF) & ~(uint32_t)mo.mask) | mo.val;
             }
-            if (m5Xfer(0, 3, micDev, mo.reg, 1, val, 50000, o)) rc |= 2;
+            if (m5Xfer(AUD_MIC_LINK, 3, micDev, mo.reg, 1, val, 50000, o)) rc |= 2;
             nw++;
         }
         IOLog("AudShim M7: rollback RT714 PS3 + muted (%s)\n", (rc & 2) ? "with errors" : "ok");
         m5Flags &= ~kF5Mic;
     }
-    if ((m5Flags & kF5CPort) && m4LinkPowered(0)) {
-        uint32_t b = cdnsBase(0);
+    if ((m5Flags & kF5CPort) && m4LinkPowered(AUD_MIC_LINK)) {
+        uint32_t b = cdnsBase(AUD_MIC_LINK);
         if (r4(b + 0x204)) { w4(b + 0x204, 0); nw++; }
         if (r4(b + 0x21C)) { w4(b + 0x21C, 0); nw++; }
         m5Flags &= ~kF5CPort;
@@ -3147,8 +3149,9 @@ void AudShim::m5Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
         // same multi-link path for one link: CMDSYNC(0), deferred FrameCtrl write, SYNCGO). The result layout keeps the
         // speaker slots: link 1 -> o[5..7], link 2 -> o[8..10]; link 0 uses o[5..7] (mask 0x1 only).
         uint32_t mask = (uint32_t)a0, bank = (uint32_t)a1;
-        if ((mask != AUD_SPK_LINK_MASK && mask != 0x1) || bank > 1) { o[0] = kM2BadOp; break; }
-        uint32_t lfirst = (mask == 0x1) ? 0 : AUD_SPK_LINK_FIRST, llast = (mask == 0x1) ? 0 : AUD_SPK_LINK_LAST;
+        if ((mask != AUD_SPK_LINK_MASK && mask != AUD_MIC_MASK) || bank > 1) { o[0] = kM2BadOp; break; }
+        uint32_t lfirst = (mask == AUD_MIC_MASK) ? AUD_MIC_LINK : AUD_SPK_LINK_FIRST,
+                 llast = (mask == AUD_MIC_MASK) ? AUD_MIC_LINK : AUD_SPK_LINK_LAST;
         for (uint32_t l = lfirst; l <= llast; l++)
             if (m4Step[l] != kLRun || !m4LinkPowered(l)) { o[0] = kM2Precond; o[1] = l; break; }
         if (o[0]) break;
@@ -3170,7 +3173,7 @@ void AudShim::m5Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
         uint64_t t0 = nowUs();
         uint32_t bad = 0;
         for (uint32_t l = lfirst; l <= llast; l++) {
-            uint32_t slot = l ? l - 1 : 0;
+            uint32_t slot = (mask == AUD_MIC_MASK) ? 0 : l - AUD_SPK_LINK_FIRST;   // result slots o[5..7], o[8..10]
             uint32_t b = cdnsBase(l), is = 0, fs = 0, t = 0;
             bool got = false;
             while (t < 3000000) {
@@ -3188,7 +3191,7 @@ void AudShim::m5Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
         }
         IODelay(200);   // ~10 frames at 48 kHz: the new bank is active from the frame after the FrameCtrl write
         for (uint32_t l = lfirst; l <= llast; l++) {
-            uint32_t slot = l ? l - 1 : 0;
+            uint32_t slot = (mask == AUD_MIC_MASK) ? 0 : l - AUD_SPK_LINK_FIRST;   // result slots o[5..7], o[8..10]
             o[7 + 3 * slot] = r4(cdnsBase(l) + kCdSTAT);
             OPLOG("AudShim M5: link %u bank switch to %u: %s resp 0x%08x MCP_STAT 0x%08x\n", l, bank,
                   (o[6 + 3 * slot] >> 32) ? "response" : "TIMEOUT", (uint32_t)o[5 + 3 * slot], (uint32_t)o[7 + 3 * slot]);
@@ -3417,12 +3420,12 @@ bool AudShim::drvSdw() {
             uint32_t mfg = (uint32_t)((a >> 24) & 0xFFFF), part = (uint32_t)((a >> 8) & 0xFFFF);
             IOLog("AudShim DRV: link %u device %u: mfg 0x%04x part 0x%04x unique %u\n", l, num[k], mfg, part, (uint32_t)((a >> 40) & 0xF));
             if (num[k] == 1 && mfg == 0x025D && part == 0x1316) found |= 1u << l;
-            if (l == 0 && mfg == 0x025D && part == 0x0714) micDev = num[k];   // M7: the RT714 (microphones)
+            if (l == AUD_MIC_LINK && mfg == 0x025D && part == 0x0714) micDev = num[k];   // M7: the RT714 (microphones)
         }
         drvCall(kM4OpStatPoll, (uint64_t)l | (1ULL << 24), 50, o);   // ack slave status (w1c), as audctl does
     }
     if ((found & AUD_SPK_LINK_MASK) != AUD_SPK_LINK_MASK) { drvFail(35, found, "S35 RT1316 device 1 missing on a speaker link"); return false; }
-    if (!micDev) IOLog("AudShim DRV: no RT714 (025D:0714) on link 0: microphones unavailable\n");
+    if (!micDev) IOLog("AudShim DRV: no RT714 (025D:0714) on link %u: microphones unavailable\n", AUD_MIC_LINK);
     return true;
 }
 
@@ -3825,7 +3828,7 @@ IOMemoryDescriptor *AudShim::drvRingMemory(AudShimUserClient *c) {
 
 // BAR4 stores for the capture stream: link 0, PDI 2 only (topology ALH2.IN = 0 << 8 | 2).
 bool AudShim::m7Allowed(uint32_t off, unsigned width) {
-    const uint32_t l = 0, pdi = 2, alh = l * 16 + pdi + 3 + 2;   // = 7 (intel_pdi_alh_configure)
+    const uint32_t l = AUD_MIC_LINK, pdi = 2, alh = l * 16 + pdi + 3 + 2;   // 55 on link 3 (XPS link 0: 7) (intel_pdi_alh_configure)
     if (width == 16 && off == kSdwShim + 0x022 + 0x60 * l + 2 * pdi) return true;   // PCMSyCHM(0, 2)
     if (width == 32 && off == kSdwShim + 0x800 + 4 * alh) return true;              // ALH STRMZCFG(7)
     if (width != 32 || (off & 3)) return false;
@@ -3967,7 +3970,7 @@ void AudShim::m7Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
     case kM7OpMicXfer: {
         uint32_t cnt = (uint32_t)((a0 >> 8) & 0xFF), cmd = (uint32_t)((a0 >> 16) & 0xFF);
         uint32_t dat = (uint32_t)((a0 >> 32) & 0xFF), addr = (uint32_t)a1;
-        bool ok = micDev >= 1 && micDev <= 11 && m4Step[0] == kLRun && m4LinkPowered(0) &&
+        bool ok = micDev >= 1 && micDev <= 11 && m4Step[AUD_MIC_LINK] == kLRun && m4LinkPowered(AUD_MIC_LINK) &&
                   ((cmd == 2 && cnt >= 1 && cnt <= 6) || (cmd == 3 && cnt == 1)) &&
                   m7MicRegOk(addr, cmd == 3) && m7MicRegOk(addr + cnt - 1, cmd == 3);
         if (!ok) {
@@ -3976,7 +3979,7 @@ void AudShim::m7Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
             break;
         }
         if (cmd == 3) m5Flags |= kF5Mic;
-        m5Xfer(0, cmd, micDev, addr, cnt, dat, kCdnsTxTimeoutMs * 1000, o);
+        m5Xfer(AUD_MIC_LINK, cmd, micDev, addr, cnt, dat, kCdnsTxTimeoutMs * 1000, o);
         OPLOG("AudShim M7: RT714 %s 0x%08x%s%02x -> %s\n", cmd == 3 ? "WRITE" : "READ ", addr, cmd == 3 ? " = 0x" : " x",
               cmd == 3 ? dat : cnt, o[1] == 0 ? "ok" : o[1] == 1 ? "IGNORED" : o[1] == 2 ? "NACK" : "TIMEOUT");
         o[0] = kM2Ok;
@@ -4058,7 +4061,7 @@ bool AudShim::capProgram(uint32_t bank) {
         !micW(p + (bank ? 0x35 : 0x25), kDrvXpOff2) || !micW(p + (bank ? 0x37 : 0x27), 0) ||
         !micW(p + (bank ? 0x33 : 0x23), (kDrvXpSi - 1) >> 8) || !micW(p + (bank ? 0x36 : 0x26), (kDrvXpHstart << 4) | kDrvXpHstop))
         return false;
-    uint32_t b = cdnsBase(0), cfg = bank ? 0x218 : 0x200;
+    uint32_t b = cdnsBase(AUD_MIC_LINK), cfg = bank ? 0x218 : 0x200;
     uint32_t c = r4(b + cfg) & ~((3u << 16) | (1u << 18));
     if (!drvRegW(b + cfg, 32, c) || !drvRegW(b + cfg + 0x0C, 32, kDrvXpOff1 | (kDrvXpOff2 << 8)) ||
         !drvRegW(b + cfg + 0x10, 32, (kDrvXpHstart << 4) | kDrvXpHstop) || !drvRegW(b + cfg + 0x08, 32, kDrvXpSi - 1))
@@ -4072,13 +4075,13 @@ bool AudShim::capProgram(uint32_t bank) {
 
 bool AudShim::capPorts(uint32_t bank, bool en) {   // sdw_enable_disable_ports: RT714 DP4 ChannelEn + master port 2 CH_EN
     return micW(kDrvMicPort * 0x100 + (bank ? 0x30 : 0x20), en ? kDrvXpChMask : 0) &&
-           drvRegW(cdnsBase(0) + (bank ? 0x21C : 0x204), 32, en ? kDrvXpChMask : 0);
+           drvRegW(cdnsBase(AUD_MIC_LINK) + (bank ? 0x21C : 0x204), 32, en ? kDrvXpChMask : 0);
 }
 
 bool AudShim::capBank(uint32_t bank) {
     uint64_t o[16];
-    if (drvCall(kM5OpBank, 0x1, bank, o) != kM2Ok) {
-        IOLog("AudShim DRV: link 0 bank switch to %u failed (result %llu, timeout mask 0x%llx)\n", bank, o[0], o[12]);
+    if (drvCall(kM5OpBank, AUD_MIC_MASK, bank, o) != kM2Ok) {
+        IOLog("AudShim DRV: mic link bank switch to %u failed (result %llu, timeout mask 0x%llx)\n", bank, o[0], o[12]);
         return false;
     }
     return true;
@@ -4101,8 +4104,8 @@ bool AudShim::capStartSeq() {
     uint64_t o[16];
     uint64_t t0 = nowUs();
     capFailStep = 0; capFailCode = 0;
-    if (!micDev) { capFail(69, 0, "no RT714 found on link 0 at enumeration"); return false; }
-    if ((r4(cdnsBase(0) + kCdSTAT) >> 20) & 1) { capFail(69, 1, "link 0 not in bank 0"); return false; }
+    if (!micDev) { capFail(69, 0, "no RT714 found on the mic link at enumeration"); return false; }
+    if ((r4(cdnsBase(AUD_MIC_LINK) + kCdSTAT) >> 20) & 1) { capFail(69, 1, "mic link not in bank 0"); return false; }
     if (!micInit) {
         if (!micPhase(1)) { capFail(70, 0, "RT714 attach init (sdw_initialize_slave + rt715_sdca_io_init + UCM boot)"); return false; }
         micInit = true;
@@ -4125,13 +4128,13 @@ bool AudShim::capStartSeq() {
                 return false;
             }
     }
-    if (!capBeHwParams()) { capFail(73, 0, "BE hw_params: link 0 PDI 2 / ALH 7 registers"); return false; }
+    if (!capBeHwParams()) { capFail(73, 0, "BE hw_params: mic link PDI 2 / ALH registers"); return false; }
     if (!micPhase(2)) { capFail(73, 1, "BE hw_params: RT714 input select / rate"); return false; }
     bzero(m7Va, kM5Buf);
     __sync_synchronize();
     if (drvCall(kM7OpCapStream, 0, 0, o) != kM2Ok) { capFail(74, o[0], "FE hw_params: host capture stream SD0"); return false; }
     if (!drvIpc(kDrvCapPcmParams, false, 0)) { capFail(75, drvFailCode, "STREAM_PCM_PARAMS (capture)"); return false; }
-    if (!capProgram(1) || !capBank(1)) { capFail(76, 0, "BE prepare: params bank 1 + bank switch (link 0)"); return false; }
+    if (!capProgram(1) || !capBank(1)) { capFail(76, 0, "BE prepare: params bank 1 + bank switch (mic link)"); return false; }
     if (!micPhase(3)) { capFail(77, 0, "RT714 power up (FU02 unmute, PDE23_24 PS0)"); return false; }
     if (!capProgram(0) || !capPorts(0, true) || !capBank(0)) { capFail(78, 0, "BE enable: params + ports bank 0 + bank switch"); return false; }
     if (drvCall(kM7OpCapStream, 1, 0, o) != kM2Ok) { capFail(79, o[0], "capture host DMA RUN"); return false; }

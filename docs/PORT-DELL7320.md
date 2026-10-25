@@ -1,6 +1,6 @@
 # AudShim port: Dell Latitude 7320 Detachable (Tiger Lake)
 
-Branch `dell7320-tgl`. Stage 1 = internal speakers. Stage 2 (microphone on link 3) comes next.
+Branch `dell7320-tgl`. Stage 1 = internal speakers (tested: 3 tones on both speakers, 0 xruns). Stage 2 = microphones on link 3.
 
 ## Hardware compared with the XPS 13 Plus 9320
 
@@ -25,6 +25,16 @@ Branch `dell7320-tgl`. Stage 1 = internal speakers. Stage 2 (microphone on link 
 - `Info.plist`: IOPCIMatch 0xa0c88086.
 - `audctl.c`: `AUD_*` config block at the top (PCI id, 1 amp on link 1, 'L,R', mic link 3, default file names);
   speaker sanity check and `gen-header` emit `kDrvDai[1]`; mic sanity expects link 3 PDI 2.
+
+## Stage 2 changes (microphones)
+
+- `AudShim.cpp`: `AUD_MIC_LINK` = 3, `AUD_MIC_MASK` = 0x8. Enumeration looks for the RT714 on link 3; the RT714
+  command access, the capture register allowlist (`m7Allowed`: PCMSyCHM(3,2), ALH STRMZCFG(55), link 3 Cadence port 2),
+  the capture bank switch, BE hw_params/prepare/enable, the DAI_CONFIG check (ALH dai_index 0x300) and the rollback
+  all use the mic link. Bank-switch result slots no longer depend on the link number.
+- The RT714 register tables are unchanged (Linux uses DMIC3/DMIC4 here too, as on the XPS).
+
+Test: `tools/build/audctl rec /tmp/mic.wav --seconds=5` (talk or clap), expect "REC RESULT: OK".
 
 ## Build and test
 

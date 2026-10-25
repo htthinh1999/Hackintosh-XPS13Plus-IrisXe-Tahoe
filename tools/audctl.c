@@ -45,7 +45,7 @@
 //   audctl drv state|open|start|stop|close   M6: the kext driver mode (interface v8) through a driver connection
 //   audctl drv test [--seconds=N] [--level=dB]  M6: OPEN, map the shared ring, sine, START/STOP twice, CLOSE
 //                             (only when no other driver connection, i.e. the XeSpeakers HAL plug-in, owns it)
-//   audctl rec [OUT.wav] [--seconds=N]  M7 (interface v9): record the internal microphones (RT714 on SoundWire link 0)
+//   audctl rec [OUT.wav] [--seconds=N]  M7 (interface v9): record the internal microphones (RT714 on SoundWire link AUD_MIC_LINK)
 //                             to a 48 kHz / 2 ch / 32-bit WAV and print RMS / peak levels; works while the HAL plug-in
 //                             owns the hardware (capture-only connection) or alone (then it brings the hardware up)
 //   audctl rec --dry-run [--hex]  M7 (offline, no kext access): the planned RT714 register / SoundWire / DMA / IPC3 sequence
@@ -3588,7 +3588,7 @@ static void mic_plan_print(const struct m5plan *cp, int hex) {
     uint32_t l = d->link, pdi = d->pdi, cb = 0x30000u + 0x10000u * l;
     printf("== audctl rec plan (DRY RUN: nothing below is executed; the kext does it on CAP_START / CAP_STOP) ==\n\n");
     printf("0. hardware up (only if no driver connection has it up yet): the M6 bring-up (M3 firmware, M4 links 0-3 + enumeration,\n"
-           "   M5 speaker set-up). Enumeration must find RT714 = 025D:0714 on link 0 (DSDT SWD0 _ADR 0x000030025D071401);\n"
+           "   M5 speaker set-up). Enumeration must find RT714 = 025D:0714 on the mic link (Dell 7320: link 3; XPS: link 0);\n"
            "   the kext records its device number (expected 1).\n\n");
     printf("1. RT714 attach-time init, once per bring-up (sdw_initialize_slave, rt715_sdca_io_init, UCM BootSequence):\n");
     mic_print_phase(1, 1);
