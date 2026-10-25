@@ -81,6 +81,17 @@
 #include <time.h>
 #include <mach/mach_time.h>
 
+// ---- Dell Latitude 7320 Detachable port (TGL-LP 8086:A0C8). XPS 13 Plus 9320 values in comments.
+#define AUD_PCI_ID_STR "0xa0c88086"                     // XPS: "0x51ca8086"
+#define AUD_NAMP       1                                // XPS: 2 (RT1316 on links 1 and 2)
+#define AUD_AMP_LINKS  {1}                              // XPS: {1, 2}
+#define AUD_SPK_MASK   0x2                              // XPS: 0x6
+#define AUD_RXSEL(l)   0                                // 1 amp: 'L,R' (index 0). XPS: l == 1 ? 1 ('L,L') : 5 ('R,R')
+#define AUD_MIC_LINK   3u                               // XPS: 0 (RT714)
+#define AUD_FW_NAME    "sof-tgl.ri"                     // XPS: "sof-rpl.ri"
+#define AUD_TPLG_NAME  "sof-tgl-rt711-l0-rt1316-l1-mono-rt714-l3.tplg"   // XPS: "sof-rpl-rt1316-l12-rt714-l0.tplg"
+
+
 static io_connect_t conn;
 
 enum { kInfo = 0, kCfgRead = 1, kMmioRead = 2, kMseInfo = 3, kM2 = 4 };
@@ -612,7 +623,7 @@ static uint32_t m2_precheck(uint64_t p[16], int verbose) {
     if (!verbose) return f;
 #define CK(bit, txt, ...) printf("  [%s] " txt "\n", (f & (bit)) ? "FAIL" : " ok ", ##__VA_ARGS__)
     printf("pre-checks (read-only):\n");
-    CK(1u << 0, "PCI id 0x%08llx == 0x51ca8086", p[1]);
+    CK(1u << 0, "PCI id 0x%08llx == " AUD_PCI_ID_STR, p[1]);
     CK(1u << 1, "power state D%llu (PMCSR 0x%08llx) == D0", p[3] & 3, p[3]);
     CK(1u << 2, "command 0x%04llx MSE=1", p[2] & 0xFFFF);
     CK(1u << 3, "command BME=%llu (must stay 0: no DMA in M2)", (p[2] >> 2) & 1);
@@ -2029,6 +2040,16 @@ struct m5plan {
     char pcm_name[TP_NAME]; uint32_t pcm_id;
     int cap;                          // M7: 1 = microphone (capture) plan
 };
+// the speaker DAI on a given link, or NULL if that link is not one of the amp links (Dell 7320 port)
+static const struct m5dai *aud_dai_for_link(const struct m5plan *pl, uint32_t link) {
+    static const int al[AUD_NAMP] = AUD_AMP_LINKS;
+    int ok = 0;
+    for (int k = 0; k < AUD_NAMP; k++) if ((uint32_t)al[k] == link) ok = 1;
+    if (!ok) return NULL;
+    for (int k = 0; k < pl->ndai; k++) if (pl->dai[k].link == link) return &pl->dai[k];
+    return NULL;
+}
+
 
 static void put32(uint8_t *b, uint32_t o, uint32_t v) { b[o] = (uint8_t)v; b[o + 1] = (uint8_t)(v >> 8); b[o + 2] = (uint8_t)(v >> 16); b[o + 3] = (uint8_t)(v >> 24); }
 static void put16(uint8_t *b, uint32_t o, uint32_t v) { b[o] = (uint8_t)v; b[o + 1] = (uint8_t)(v >> 8); }
@@ -2356,8 +2377,8 @@ static int pl_build_dir(const struct tplg *tp, struct m5plan *pl, int verbose, i
     m = pl_new(&pl->trig_stop, 12, IPC_GLB_STREAM | IPC_TRIG_STOP, "STREAM_TRIG_STOP host comp %u  [I3P]:145-180", pl->host_comp);
     put32(m->b, 8, pl->host_comp);
     if (cap) {   // M7 sanity: exactly the RT714 pin (SDW0 Pin2: link 0, PDI 2), 48 kHz, 2 ch, a PGA on the path
-        if (pl->ndai != 1 || pl->dai[0].link != 0 || pl->dai[0].pdi != 2 || pl->dai[0].rate != 48000 || pl->dai[0].ch != 2) {
-            printf("  !! microphone path: expected 1 ALH DAI on link 0 PDI 2 at 48 kHz / 2 ch (found %d)\n", pl->ndai);
+        if (pl->ndai != 1 || pl->dai[0].link != AUD_MIC_LINK || pl->dai[0].pdi != 2 || pl->dai[0].rate != 48000 || pl->dai[0].ch != 2) {
+            printf("  !! microphone path: expected 1 ALH DAI on link %u PDI 2 at 48 kHz / 2 ch (found %d)\n", AUD_MIC_LINK, pl->ndai);
             return -1;
         }
         if (pl->pga_w < 0) { printf("  !! no PGA on the microphone path\n"); return -1; }
@@ -2369,10 +2390,10 @@ static int pl_build_dir(const struct tplg *tp, struct m5plan *pl, int verbose, i
         return 0;
     }
     // sanity: exactly the two RT1316 ALH pins
-    if (pl->ndai != 2) { printf("  !! expected 2 ALH DAIs on the speaker path, found %d\n", pl->ndai); return -1; }
-    for (int k = 0; k < 2; k++) {
+    if (pl->ndai != AUD_NAMP) { printf("  !! expected %d ALH DAI(s) on the speaker path, found %d\n", AUD_NAMP, pl->ndai); return -1; }
+    for (int k = 0; k < AUD_NAMP; k++) {
         const struct m5dai *dd = &pl->dai[k];
-        if ((dd->link != 1 && dd->link != 2) || dd->pdi != 2 || dd->rate != 48000 || dd->ch != 2) {
+        if (!aud_dai_for_link(pl, dd->link) || dd->pdi != 2 || dd->rate != 48000 || dd->ch != 2) {
             printf("  !! DAI %s: link %u PDI %u rate %u ch %u (M5 supports links 1/2, PDI 2, 48 kHz, 2 ch)\n", dd->wname, dd->link,
                    dd->pdi, dd->rate, dd->ch);
             return -1;
@@ -2516,7 +2537,7 @@ static int m5_bank(struct m5st *st, int bank, const char *why) {
     uint64_t o[16];
     printf("  bank switch -> bank %d (%s): CMDSYNC(1,2), deferred broadcast SCP_FrameCtrl_B%d (0x%02x) = 0x09 with SSP tag,"
            " SYNCGO  [ST2]:754-855, [IB]:243-280\n", bank, why, bank, bank ? 0x70 : 0x60);
-    if (m2call(M5_BANK, 0x6, (uint64_t)bank, o)) return -1;
+    if (m2call(M5_BANK, AUD_SPK_MASK, (uint64_t)bank, o)) return -1;
     if (o[0] == M2R_BADOP || o[0] == M2R_PRECOND) { printf("    !! refused (%s)\n", m2rc(o[0])); return -1; }
     printf("    SYNC 0x%08llx -> armed 0x%08llx -> after SYNCGO 0x%08llx -> end 0x%08llx; MCP_STAT before L1 0x%08llx L2 0x%08llx\n",
            o[1], o[3], o[4], o[11], o[2] & 0xFFFFFFFF, o[2] >> 32);
@@ -2710,13 +2731,13 @@ static int m5_run(const struct bootopt *op, const struct fwfile *f, struct m5pla
     struct m5st st; memset(&st, 0, sizeof st);
     struct sdwxp x; m5_compute(&x, 0);
     char t[160];
-    int amp_link[2] = {1, 2};
+    int amp_link[AUD_NAMP] = AUD_AMP_LINKS;
 
     // ---------------- S40 (already parsed; re-print the key facts)
     m2b_step("[S40] topology -> speaker path   (topology.c, ipc3-topology.c, sof-audio.c)");
     printf("  PCM '%s' (pcm %u), host comp %u, PGA comp %u (volume table min 0x%x max 0x%x, %u ch), DEMUX comp %u\n",
            pl->pcm_name, pl->pcm_id, pl->host_comp, pl->pga_comp, pl->vol_min, pl->vol_max, pl->vol_ch, pl->demux_comp);
-    for (int k = 0; k < 2; k++)
+    for (int k = 0; k < AUD_NAMP; k++)
         printf("  DAI %s: ALH tplg index %u -> link %u PDI %u (cpu DAI 'SDW%u Pin%u'), FW dai_index 0x%x, ALH stream id %u, %u Hz %u ch\n",
                pl->dai[k].wname, pl->dai[k].tplg_index, pl->dai[k].link, pl->dai[k].pdi, pl->dai[k].link, pl->dai[k].pdi,
                pl->dai[k].dai_index, pl->dai[k].alh_id, pl->dai[k].rate, pl->dai[k].ch);
@@ -2728,7 +2749,7 @@ static int m5_run(const struct bootopt *op, const struct fwfile *f, struct m5pla
     }
 
     // ---------------- S41 sdw_initialize_slave
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < AUD_NAMP; i++) {
         int l = amp_link[i];
         snprintf(t, sizeof t, "[S41.%d] link %d RT1316 dev 1: sdw_initialize_slave   (bus.c:1419-1490)", l, l); m2b_step(t);
         st.amp_init = 1;
@@ -2744,7 +2765,7 @@ static int m5_run(const struct bootopt *op, const struct fwfile *f, struct m5pla
     }
 
     // ---------------- S42 rt1316_io_init
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < AUD_NAMP; i++) {
         int l = amp_link[i];
         snprintf(t, sizeof t, "[S42.%d] link %d RT1316: rt1316_io_init (SW reset + blind writes)   (rt1316-sdw.c:267-306, 71-129)", l, l); m2b_step(t);
         if (rt_w(l, 0xc000, 0x02, "SW reset")) { *failstep = "S42 SW reset"; return -1; }
@@ -2768,9 +2789,9 @@ static int m5_run(const struct bootopt *op, const struct fwfile *f, struct m5pla
 
     // ---------------- S43 UCM Speaker enable
     m2b_step("[S43] UCM 'Speaker' EnableSequence: RX Channel Select + DAC Switch   (ucm2/sof-soundwire/rt1316.conf)");
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < AUD_NAMP; i++) {
         int l = amp_link[i];
-        if (rt_w(l, RT_UDMPU21_CLUSTER, l == 1 ? 1 : 5, l == 1 ? "rt1316-1 RX Channel Select = 'L,L' (index 1)" : "rt1316-2 RX Channel Select = 'R,R' (index 5)") ||
+        if (rt_w(l, RT_UDMPU21_CLUSTER, AUD_RXSEL(l), "rt1316 RX Channel Select (AUD_RXSEL)") ||
             rt_w(l, RT_FU21_MUTE_L, 0, "DAC Switch on: FU21 MUTE CH_L = 0") ||
             rt_w(l, RT_FU21_MUTE_R, 0, "DAC Switch on: FU21 MUTE CH_R = 0")) { *failstep = "S43 UCM controls"; return -1; }
         st.ucm_on = 1;
@@ -2778,8 +2799,8 @@ static int m5_run(const struct bootopt *op, const struct fwfile *f, struct m5pla
 
     // ---------------- S44 BE hw_params: Intel PDI/shim/ALH/Cadence port
     m2b_step("[S44] BE hw_params: intel_hw_params per cpu DAI (SDW1 Pin2, SDW2 Pin2)   (intel.c:720-785, 625-675; cadence_master.c:1926-1953)");
-    for (int k = 0; k < 2; k++) {   // cpu DAI order of the BE link: SDW1 Pin2, SDW2 Pin2 ([SPC]:1252-1290)
-        const struct m5dai *dd = &pl->dai[pl->dai[0].link == (uint32_t)(k + 1) ? 0 : 1];
+    for (int k = 0; k < AUD_NAMP; k++) {   // cpu DAI order of the BE link: SDW1 Pin2, SDW2 Pin2 ([SPC]:1252-1290)
+        const struct m5dai *dd = aud_dai_for_link(pl, (uint32_t)amp_link[k]);
         uint32_t l = dd->link, pdi = dd->pdi;
         printf("  link %u PDI %u: ch %u, TX (playback), ALH id %u, sdw_stream_add_master port %u ch_mask 0x%x (no register access)\n",
                l, pdi, dd->ch, dd->alh_id, pdi, x.chmask);
@@ -2826,7 +2847,7 @@ static int m5_run(const struct bootopt *op, const struct fwfile *f, struct m5pla
     // ---------------- S46 BE prepare
     m2b_step("[S46] BE prepare: sdw_prepare_stream on links 1+2   (stream.c:1474-1552, 666-752)");
     m5_compute(&x, 1);
-    for (int i = 0; i < 2; i++) if (m5_program(amp_link[i], 1, &x)) { *failstep = "S46 program params (bank 1)"; return -1; }
+    for (int i = 0; i < AUD_NAMP; i++) if (m5_program(amp_link[i], 1, &x)) { *failstep = "S46 program params (bank 1)"; return -1; }
     if (m5_bank(&st, 1, "prepare")) { *failstep = "S46 bank switch to 1"; o[0] = M2R_TIMEOUT; return -1; }
     st.bank_prep = 1;
     printf("  port prepare ([ST2]:417-618): RT1316 DP1 has simple_ch_prep_sm, no impl-def interrupts and no port_prep op; the\n"
@@ -2834,13 +2855,13 @@ static int m5_run(const struct bootopt *op, const struct fwfile *f, struct m5pla
 
     // ---------------- S47 DAPM start: amp power
     m2b_step("[S47] DAPM stream start: RT1316 CLASS D POST_PMU -> PDE23/27/22 PS0   (rt1316-sdw.c:329-370)");
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < AUD_NAMP; i++) {
         int l = amp_link[i];
         st.pde_on = 1;
         if (rt_w(l, RT_PDE23, 0, "PDE23 REQUESTED_PS = PS0") || rt_w(l, RT_PDE27, 0, "PDE27 REQUESTED_PS = PS0") ||
             rt_w(l, RT_PDE22, 0, "PDE22 REQUESTED_PS = PS0")) { *failstep = "S47 PDE PS0"; return -1; }
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < AUD_NAMP; i++) {
         int l = amp_link[i];
         uint8_t a = 0xFF, b = 0xFF, c = 0xFF;
         for (int tries = 0; tries < 10; tries++) {   // informational: SDCA ACTUAL_PS (control 0x10), up to ~100 ms
@@ -2867,7 +2888,7 @@ static int m5_run(const struct bootopt *op, const struct fwfile *f, struct m5pla
     if (!op->noplay) {
         // ---------------- S49 trigger START: BE then FE
         m2b_step("[S49] trigger START: BE sdw_enable_stream, then FE host DMA RUN + STREAM_TRIG_START   (stream.c:1597-1638, pcm.c:385-495)");
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < AUD_NAMP; i++) {
             if (m5_program(amp_link[i], 0, &x)) { *failstep = "S49 program params (bank 0)"; return -1; }
             if (m5_ports(amp_link[i], 0, 1, &x)) { *failstep = "S49 enable ports"; return -1; }
         }
@@ -2929,10 +2950,10 @@ static int m5_run(const struct bootopt *op, const struct fwfile *f, struct m5pla
         if (m2call(M5_STREAM, 3, 0, o) || o[0] != M2R_OK) { *failstep = "S51 stream hw_free"; return -1; }
         printf("  stream hw_free: SD CTL 0x%08llx, PPCTL 0x%08llx, EM2 0x%08llx (L1SEN %llu)\n", o[1], o[2], o[3], (o[3] >> 13) & 1);
         st.sprep = 0;
-        for (int i = 0; i < 2; i++) if (m5_ports(amp_link[i], 1, 0, &x)) { *failstep = "S51 disable ports (bank 1)"; return -1; }
-        for (int i = 0; i < 2; i++) if (m5_program(amp_link[i], 1, &x)) { *failstep = "S51 program params (bank 1)"; return -1; }
+        for (int i = 0; i < AUD_NAMP; i++) if (m5_ports(amp_link[i], 1, 0, &x)) { *failstep = "S51 disable ports (bank 1)"; return -1; }
+        for (int i = 0; i < AUD_NAMP; i++) if (m5_program(amp_link[i], 1, &x)) { *failstep = "S51 program params (bank 1)"; return -1; }
         if (m5_bank(&st, 1, "disable")) { *failstep = "S51 bank switch to 1"; o[0] = M2R_TIMEOUT; return -1; }
-        for (int i = 0; i < 2; i++) if (m5_ports(amp_link[i], 0, 0, &x)) { *failstep = "S51 disable ports (bank 0)"; return -1; }
+        for (int i = 0; i < AUD_NAMP; i++) if (m5_ports(amp_link[i], 0, 0, &x)) { *failstep = "S51 disable ports (bank 0)"; return -1; }
         st.enabled = 0;
     } else {
         m2b_step("[S49-S51] skipped (--no-play / M5a): nothing was enabled or started");
@@ -2947,13 +2968,13 @@ static int m5_run(const struct bootopt *op, const struct fwfile *f, struct m5pla
     }
     for (int i = 0; i < pl->nf; i++) if (m5_ipc(&st, f, &pl->f[i], o)) { *failstep = "S52 widget free IPC"; return -1; }
     st.ipc_setup = 0;
-    for (int i = 0; i < 2; i++) if (m5_program(amp_link[i], 0, &x)) { *failstep = "S52 program params (bank 0)"; return -1; }
+    for (int i = 0; i < AUD_NAMP; i++) if (m5_program(amp_link[i], 0, &x)) { *failstep = "S52 program params (bank 0)"; return -1; }
     if (m5_bank(&st, 0, "deprepare")) { *failstep = "S52 bank switch to 0"; o[0] = M2R_TIMEOUT; return -1; }
     st.bank_prep = 0;
 
     // ---------------- S53 amps off
     m2b_step("[S53] DAPM stop + UCM disable: PDE23/27/22 PS3, DAC Switch off   (rt1316-sdw.c:352-367, rt1316.conf DisableSequence)");
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < AUD_NAMP; i++) {
         int l = amp_link[i];
         if (rt_w(l, RT_PDE23, 3, "PDE23 REQUESTED_PS = PS3") || rt_w(l, RT_PDE27, 3, "PDE27 REQUESTED_PS = PS3") ||
             rt_w(l, RT_PDE22, 3, "PDE22 REQUESTED_PS = PS3") || rt_w(l, RT_FU21_MUTE_L, 1, "DAC Switch off: FU21 MUTE CH_L = 1") ||
@@ -2994,10 +3015,10 @@ stop_dma:
 static int cmd_boot(int argc, char **argv, int mode) {   // mode 0 m2b, 1 m3, 2 m4, 3 m5, 4 m5a (= m5 --no-play)
     char defpath[1024];
     const char *home = getenv("HOME");
-    snprintf(defpath, sizeof defpath, "%s/xe/build/audio/fw/use/sof-rpl.ri", home ? home : "");
+    snprintf(defpath, sizeof defpath, "%s/xe/build/audio/fw/use/" AUD_FW_NAME, home ? home : "");
     int m3 = mode >= 1, m4 = mode >= 2, m5 = mode >= 3;
     char tdef[1024];
-    snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/sof-rpl-rt1316-l12-rt714-l0.tplg", home ? home : "");
+    snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/" AUD_TPLG_NAME, home ? home : "");
     struct bootopt op = {3, 1, 1, 1, 0, 1, 0, m3, 0, 300, 2000, defpath, m4, 0xF, 1000, m5, mode == 4, 0, 0, -30.0, 2.0, tdef};
     const char *cmd = m5 ? (mode == 4 ? "m5a" : "m5") : m4 ? "m4" : m3 ? "m3" : "m2b";
     const char *MN = m5 ? "M5" : m4 ? "M4" : m3 ? "M3" : "M2b";
@@ -3650,8 +3671,8 @@ static void gh_msg(FILE *f, const char *name, const struct ipcmsg *m) {
 static int cmd_genheader(int argc, char **argv) {
     char defpath[1024], tdef[1024];
     const char *home = getenv("HOME");
-    snprintf(defpath, sizeof defpath, "%s/xe/build/audio/fw/use/sof-rpl.ri", home ? home : "");
-    snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/sof-rpl-rt1316-l12-rt714-l0.tplg", home ? home : "");
+    snprintf(defpath, sizeof defpath, "%s/xe/build/audio/fw/use/" AUD_FW_NAME, home ? home : "");
+    snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/" AUD_TPLG_NAME, home ? home : "");
     const char *out = "AudShimData.h", *fwp = defpath, *tpp = tdef;
     for (int i = 0; i < argc; i++) {
         if (!strncmp(argv[i], "--fw=", 5)) fwp = argv[i] + 5;
@@ -3701,11 +3722,12 @@ static int cmd_genheader(int argc, char **argv) {
     fprintf(f, "static const uint32_t kDrvPgaComp = %u, kDrvVolCh = %u, kDrvVolMin = 0x%x, kDrvVolMax = 0x%x, kDrvHostComp = %u;\n",
             pl.pga_comp, pl.vol_ch, pl.vol_min, pl.vol_max, pl.host_comp);
     // DAIs in BE cpu-DAI order: link 1 first
-    fprintf(f, "\n// speaker DAIs (BE hw_params order: SDW1 Pin2, SDW2 Pin2)\nstatic const AudDrvDai kDrvDai[2] = {\n");
-    for (int k = 0; k < 2; k++) {
-        const struct m5dai *dd = &pl.dai[pl.dai[0].link == (uint32_t)(k + 1) ? 0 : 1];
+    fprintf(f, "\n// speaker DAIs (BE hw_params order: ascending link)\nstatic const AudDrvDai kDrvDai[%d] = {\n", AUD_NAMP);
+    { static const int al[AUD_NAMP] = AUD_AMP_LINKS;
+    for (int k = 0; k < AUD_NAMP; k++) {
+        const struct m5dai *dd = aud_dai_for_link(&pl, (uint32_t)al[k]);
         fprintf(f, "    {%u, %u, %u, %u, 0x%x},   // %s\n", dd->link, dd->pdi, dd->alh_id, dd->ch, dd->dai_index, dd->wname);
-    }
+    } }
     fprintf(f, "};\n\n// SoundWire transport/port parameters (m5_compute, generic_bandwidth_allocation.c)\n");
     fprintf(f, "static const uint32_t kDrvXpSi = %u, kDrvXpHstart = %u, kDrvXpHstop = %u, kDrvXpOff1 = %u, kDrvXpOff2 = %u,\n"
                "                      kDrvXpBps = %u, kDrvXpChMask = 0x%x;\n", x.si, x.hstart, x.hstop, x.offset1, x.offset2, x.bps, x.chmask);
@@ -3750,7 +3772,7 @@ static int cmd_genheader(int argc, char **argv) {
     fprintf(f, "};\n\n#endif\n");
     fclose(f);
     printf("wrote %s: %d set-up + %d free IPC messages, PGA comp %u (%u ch), DAIs ALH %u/%u, %zu RT1316 writes,\n"
-           "  firmware payload %u bytes FNV-1a 0x%08x\n", out, pl.n, pl.nf, pl.pga_comp, pl.vol_ch, pl.dai[0].alh_id, pl.dai[1].alh_id,
+           "  firmware payload %u bytes FNV-1a 0x%08x\n", out, pl.n, pl.nf, pl.pga_comp, pl.vol_ch, pl.dai[0].alh_id, pl.dai[AUD_NAMP - 1].alh_id,
            sizeof rt1316_blind / sizeof rt1316_blind[0], fw.psize, fw.hash);
     printf("  M7 capture: %d set-up + %d free IPC messages, host comp %u, PGA comp %u, ALH %u (link %u PDI %u), %d RT714 ops\n",
            cp.n, cp.nf, cp.host_comp, cp.pga_comp, cp.dai[0].alh_id, cp.dai[0].link, cp.dai[0].pdi, NMICOPS);
@@ -3904,7 +3926,7 @@ static int cmd_rec(int argc, char **argv) {
     int dry = 0, hex = 0;
     const char *out = "mic.wav", *tpath = NULL;
     char tdef[1024]; const char *home = getenv("HOME");
-    snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/sof-rpl-rt1316-l12-rt714-l0.tplg", home ? home : "");
+    snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/" AUD_TPLG_NAME, home ? home : "");
     for (int i = 0; i < argc; i++) {
         if (!strncmp(argv[i], "--seconds=", 10)) secs = strtod(argv[i] + 10, NULL);
         else if (!strcmp(argv[i], "--dry-run") || !strcmp(argv[i], "--dry")) dry = 1;
@@ -4052,14 +4074,14 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "tplg")) {   // offline: topology dump + the generated IPC3 plan (no kext needed)
         static struct tplg tp; static struct m5plan pl;
         char tdef[1024]; const char *home = getenv("HOME"), *path = NULL; int hex = 0, quiet = 0;
-        snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/sof-rpl-rt1316-l12-rt714-l0.tplg", home ? home : "");
+        snprintf(tdef, sizeof tdef, "%s/xe/build/audio/fw/use/" AUD_TPLG_NAME, home ? home : "");
         for (int i = 2; i < argc; i++) { if (!strcmp(argv[i], "--hex")) hex = 1; else if (!strcmp(argv[i], "--plan")) quiet = 1; else path = argv[i]; }
         printf("audctl 0.9.0  tplg: ALSA/SOF topology parser + IPC3 plans for the speaker and microphone PCMs (read-only, no kext access)\n\n");
         if (tplg_load(&tp, path ? path : tdef, 1)) return 1;
         if (!quiet) tplg_dump(&tp);
         printf("\n-- speaker playback plan (what Linux sends for 'Speaker', pcm 2) --\n");
         if (pl_build(&tp, &pl, 1)) return 1;
-        for (int k = 0; k < 2; k++)
+        for (int k = 0; k < pl.ndai; k++)
             printf("  %s: link %u PDI %u ALH stream id %u, FW dai_index 0x%x, %u Hz %u ch fmt %u\n", pl.dai[k].wname, pl.dai[k].link,
                    pl.dai[k].pdi, pl.dai[k].alh_id, pl.dai[k].dai_index, pl.dai[k].rate, pl.dai[k].ch, pl.dai[k].fmt);
         pl_print(&pl, hex);

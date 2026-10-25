@@ -1,5 +1,6 @@
 // AudShim (milestone M7, v0.9.0): kernel shim for the Intel cAVS 2.5 audio DSP
 // (PCI 8086:51CA, RPL-P, Dell XPS 13 Plus 9320, ACPI \_SB.PC00.HDAS at 0:31.3).
+// Dell Latitude 7320 Detachable port: PCI 8086:A0C8 (TGL-LP), see AUD_SPK_* / AUD_EMPTY_LINK below.
 //
 // M7 (v0.9.0, interface v9) adds the internal microphones (RT714 = rt715-sdca on SoundWire link 0, DMIC3/4 on its DP4,
 // SOF capture pipeline 5 'Microphone': ALH2.IN -> EQIIR -> PGA -> host PCM4C, host DMA capture stream SD0) to the
@@ -136,7 +137,7 @@
 //     (same 16-bit RMW, other bits as found), after the BAR maps are released;
 //   - never resets the function (no FLR, no GCTL.CRST), never calls PMinit/joinPMtree/
 //     registerPowerDriver, never opens the provider;
-//   - refuses to start on anything whose live config dword 0 is not 0x51CA8086, and refuses
+//   - refuses to start on anything whose live config dword 0 is not AUD_PCI_ID, and refuses
 //     to start with the boot-arg -audshimoff.
 //
 // Why MSE alone is safe: it only makes the function decode its two already-assigned BAR windows
@@ -201,7 +202,16 @@ static void pollStep(uint32_t elapsedUs) {
     if (elapsedUs < 20000) IODelay(500); else IOSleep(1);
 }
 
-#define AUD_PCI_ID 0x51CA8086u   // device << 16 | vendor, as in config dword 0
+#define AUD_PCI_ID 0xA0C88086u   // device << 16 | vendor, as in config dword 0
+// Dell Latitude 7320 Detachable port (TGL-LP 8086:A0C8, sof-tgl-rt711-l0-rt1316-l1-mono-rt714-l3.tplg):
+// one RT1316 on link 1 driving both speakers ('L,R'), RT711 jack codec on link 0 (left idle), RT714 on
+// link 3, link 2 empty (DSDT template only; bus clashes in Linux). XPS 13 Plus values in comments.
+#define AUD_SPK_LINK_FIRST 1u                 // XPS: 1
+#define AUD_SPK_LINK_LAST  1u                 // XPS: 2
+#define AUD_SPK_LINK_MASK  0x2u               // XPS: 0x6
+#define AUD_SPK_NDAI       (AUD_SPK_LINK_LAST - AUD_SPK_LINK_FIRST + 1)
+#define AUD_SPK_RXSEL(l)   (0u)               // UCM rt1316.conf, 1 amp: 'L,R' = index 0. XPS: l == 1 ? 1 ('L,L') : 5 ('R,R')
+#define AUD_EMPTY_LINK     2u                 // XPS: 3
 
 enum {
     kAudShimInfo = 0,       // out: 16 x uint64 (see sInfo)
@@ -721,7 +731,7 @@ IOService *AudShim::probe(IOService *provider, SInt32 *score) {
     if (PE_parse_boot_argn("-audshimoff", dummy, sizeof(dummy))) return nullptr;
     IOPCIDevice *dev = OSDynamicCast(IOPCIDevice, provider);
     // Second line of defence behind IOPCIMatch: the live hardware ID, not the (spoofable)
-    // device-id property, must be 8086:51CA.
+    // device-id property, must be AUD_PCI_ID.
     if (!dev || dev->configRead32(kIOPCIConfigVendorID) != AUD_PCI_ID) return nullptr;
     return IOService::probe(provider, score);
 }
@@ -2635,7 +2645,7 @@ static void m5Log(const char *what, uint32_t off, uint32_t before, uint32_t afte
 // The M5 BAR4 store whitelist (on top of m4Allowed). Only links 1 and 2 (the RT1316 links), only PDI 2
 // (the "SDW1 Pin2"/"SDW2 Pin2" cpu DAIs of the speaker BE link: topology ALH 258 = 1<<8|2, 514 = 2<<8|2).
 bool AudShim::m5Allowed(uint32_t off, unsigned width) {
-    for (uint32_t l = 1; l <= 2; l++) {
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++) {
         if (width == 16 && off == kSdwShim + 0x022 + 0x60 * l + 2 * 2) return true;   // PCMSyCHM(l, 2) sdw_intel.h:68
         if (width == 32 && off == kSdwShim + 0x800 + 4 * (l * 16 + 2 + 3 + 2)) return true; // ALH STRMZCFG(id) sdw_intel.h:109
         if (width != 32 || (off & 3)) continue;
@@ -2856,7 +2866,7 @@ uint32_t AudShim::m5Rollback() {
     if (m5Flags & kF5Amp) {
         static const uint32_t regs[5] = { kRtFu21MuteL, kRtFu21MuteR, kRtPde23, kRtPde27, kRtPde22 };
         static const uint32_t vals[5] = { 1, 1, 3, 3, 3 };
-        for (uint32_t l = 1; l <= 2; l++) {
+        for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++) {
             if (m4Step[l] != kLRun || !m4LinkPowered(l)) continue;
             for (int k = 0; k < 5; k++) {
                 uint64_t o[16] = {};
@@ -2892,7 +2902,7 @@ uint32_t AudShim::m5Rollback() {
     }
     // 3. master port 2 channels off in both banks (cdns_port_enable, cadence_master.c:1650-1665)
     if (m5Flags & kF5Port) {
-        for (uint32_t l = 1; l <= 2; l++) {
+        for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++) {
             if (!m4LinkPowered(l)) continue;
             uint32_t b = cdnsBase(l);
             if (r4(b + 0x204)) { w4(b + 0x204, 0); nw++; }
@@ -2922,7 +2932,7 @@ void AudShim::m5Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
         o[8] = m5Iova; o[9] = m5Phys;
         if (cpa0 && !mmioReady()) {
             o[12] = r4(kHIPCIDR) | ((uint64_t)r4(kHIPCIDA) << 32); o[13] = r4(kHIPCTDR);
-            for (uint32_t l = 1; l <= 2; l++)
+            for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++)
                 if (m4LinkPowered(l)) o[14] |= (uint64_t)r4(cdnsBase(l) + kCdSTAT) << (32 * (l - 1));
         }
         o[0] = kM2Ok;
@@ -3111,7 +3121,7 @@ void AudShim::m5Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
     case kM5OpXfer: {
         uint32_t l = (uint32_t)(a0 & 0xFF), cnt = (uint32_t)((a0 >> 8) & 0xFF), cmd = (uint32_t)((a0 >> 16) & 0xFF);
         uint32_t dev = (uint32_t)((a0 >> 24) & 0xF), dat = (uint32_t)((a0 >> 32) & 0xFF), addr = (uint32_t)a1;
-        bool ok = (l == 1 || l == 2) && m4Step[l] == kLRun && m4LinkPowered(l) && dev == 1 &&
+        bool ok = (l >= AUD_SPK_LINK_FIRST && l <= AUD_SPK_LINK_LAST) && m4Step[l] == kLRun && m4LinkPowered(l) && dev == 1 &&
                   ((cmd == 2 && cnt >= 1 && cnt <= 6) || (cmd == 3 && cnt == 1)) &&
                   m5RtRegOk(addr, cmd == 3) && m5RtRegOk(addr + cnt - 1, cmd == 3);
         if (!ok) {
@@ -3137,8 +3147,8 @@ void AudShim::m5Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
         // same multi-link path for one link: CMDSYNC(0), deferred FrameCtrl write, SYNCGO). The result layout keeps the
         // speaker slots: link 1 -> o[5..7], link 2 -> o[8..10]; link 0 uses o[5..7] (mask 0x1 only).
         uint32_t mask = (uint32_t)a0, bank = (uint32_t)a1;
-        if ((mask != 0x6 && mask != 0x1) || bank > 1) { o[0] = kM2BadOp; break; }
-        uint32_t lfirst = (mask == 0x1) ? 0 : 1, llast = (mask == 0x1) ? 0 : 2;
+        if ((mask != AUD_SPK_LINK_MASK && mask != 0x1) || bank > 1) { o[0] = kM2BadOp; break; }
+        uint32_t lfirst = (mask == 0x1) ? 0 : AUD_SPK_LINK_FIRST, llast = (mask == 0x1) ? 0 : AUD_SPK_LINK_LAST;
         for (uint32_t l = lfirst; l <= llast; l++)
             if (m4Step[l] != kLRun || !m4LinkPowered(l)) { o[0] = kM2Precond; o[1] = l; break; }
         if (o[0]) break;
@@ -3332,7 +3342,7 @@ bool AudShim::drvPorts(uint32_t l, uint32_t bank, bool en) {
 
 bool AudShim::drvBank(uint32_t bank) {
     uint64_t o[16];
-    if (drvCall(kM5OpBank, 0x6, bank, o) != kM2Ok) {
+    if (drvCall(kM5OpBank, AUD_SPK_LINK_MASK, bank, o) != kM2Ok) {
         IOLog("AudShim DRV: bank switch to %u failed (result %llu, timeout mask 0x%llx)\n", bank, o[0], o[12]);
         return false;
     }
@@ -3362,8 +3372,11 @@ bool AudShim::drvSdw() {
     uint32_t v = r4(kSdwShim);
     if ((v & 7) < kSdwLinks) { drvFail(30, v, "S30 LCAP.LCOUNT < 4"); return false; }
     if (r4(kSdwLCTL) & 0xF0F) { drvFail(30, r4(kSdwLCTL), "S30 links already powered"); return false; }
-    if (drvCall(kM4OpPowerUp, 0xF, 0, o) != kM2Ok) { drvFail(31, o[0], "S31 link power-up"); return false; }
+    // Dell 7320: link 2 has no codec (DSDT template only) and shows bus clashes / clock-stop failures in Linux,
+    // so it is left powered off and skipped. XPS: all four links (0xF).
+    if (drvCall(kM4OpPowerUp, 0xFu & ~(1u << AUD_EMPTY_LINK), 0, o) != kM2Ok) { drvFail(31, o[0], "S31 link power-up"); return false; }
     for (uint32_t l = 0; l < kSdwLinks; l++) {
+        if (l == AUD_EMPTY_LINK) continue;
         uint64_t r = drvCall(kM4OpShimInit, l, 0, o);
         if (r != kM2Ok && r != kM2Verify) { drvFail(32, r, "S32 shim init"); return false; }
         if (drvCall(kM4OpSoftReset, l, 0, o) != kM2Ok) { drvFail(33, o[0], "S33a soft reset"); return false; }
@@ -3376,8 +3389,9 @@ bool AudShim::drvSdw() {
     }
     uint32_t found = 0;
     for (uint32_t l = 0; l < kSdwLinks; l++) {
-        // dev0 attach: 1000 ms on the links the DSDT populates (0-2), 100 ms on the empty link 3
-        if (drvCall(kM4OpStatPoll, (uint64_t)l | (1ULL << 16), l == 3 ? 100 : 1000, o) != kM2Ok) continue;
+        if (l == AUD_EMPTY_LINK) continue;
+        // dev0 attach: 1000 ms on populated links, 100 ms on the empty link (AUD_EMPTY_LINK)
+        if (drvCall(kM4OpStatPoll, (uint64_t)l | (1ULL << 16), l == AUD_EMPTY_LINK ? 100 : 1000, o) != kM2Ok) continue;
         uint64_t adr[12] = {}; uint32_t num[12] = {}, used = 0; int nd = 0;
         for (int count = 0; count < 24; count++) {   // sdw_program_device_num (bus.c:827-912)
             uint8_t id[6] = {};
@@ -3407,7 +3421,7 @@ bool AudShim::drvSdw() {
         }
         drvCall(kM4OpStatPoll, (uint64_t)l | (1ULL << 24), 50, o);   // ack slave status (w1c), as audctl does
     }
-    if ((found & 0x6) != 0x6) { drvFail(35, found, "S35 RT1316 device 1 missing on link 1 and/or 2"); return false; }
+    if ((found & AUD_SPK_LINK_MASK) != AUD_SPK_LINK_MASK) { drvFail(35, found, "S35 RT1316 device 1 missing on a speaker link"); return false; }
     if (!micDev) IOLog("AudShim DRV: no RT714 (025D:0714) on link 0: microphones unavailable\n");
     return true;
 }
@@ -3415,24 +3429,24 @@ bool AudShim::drvSdw() {
 // M5 S40-S44 (static part): bank check, sdw_initialize_slave, rt1316_io_init, RX channel select (amps stay muted
 // and in PS3 until START), BE hw_params registers.
 bool AudShim::drvAmpStatic() {
-    for (uint32_t l = 1; l <= 2; l++)
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++)
         if ((r4(cdnsBase(l) + kCdSTAT) >> 20) & 1) { drvFail(40, l, "S40 unexpected active bank"); return false; }
-    for (uint32_t l = 1; l <= 2; l++) {   // S41 sdw_initialize_slave (bus.c:1419-1490)
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++) {   // S41 sdw_initialize_slave (bus.c:1419-1490)
         uint8_t v = 0;
         if (!rtW(l, 0x4D, 1) || !rtW(l, 0x62, 3) || !rtW(l, 0x72, 3) || !rtR(l, 0x40, &v) ||
             ((v & 2) && !rtW(l, 0x40, 2)) || !rtUpd(l, 0x41, 0x03, 0x03)) { drvFail(41, l, "S41 sdw_initialize_slave"); return false; }
     }
-    for (uint32_t l = 1; l <= 2; l++) {   // S42 rt1316_io_init (rt1316-sdw.c:267-306)
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++) {   // S42 rt1316_io_init (rt1316-sdw.c:267-306)
         if (!rtW(l, 0xc000, 0x02)) { drvFail(42, l, "S42 RT1316 SW reset"); return false; }
         for (uint32_t k = 0; k < sizeof kDrvRtBlind / sizeof kDrvRtBlind[0]; k++)
             if (!rtW(l, kDrvRtBlind[k].reg, kDrvRtBlind[k].val)) { drvFail(42, (l << 8) | k, "S42 RT1316 blind write"); return false; }
     }
-    for (uint32_t l = 1; l <= 2; l++) {   // S43 UCM: rt1316-1 'L,L', rt1316-2 'R,R'; DAC switch stays OFF until START
-        if (!rtW(l, kRtUdmpu21, l == 1 ? 1 : 5) || !rtW(l, kRtFu21MuteL, 1) || !rtW(l, kRtFu21MuteR, 1)) {
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++) {   // S43 UCM: RX Channel Select (AUD_SPK_RXSEL); DAC switch stays OFF until START
+        if (!rtW(l, kRtUdmpu21, AUD_SPK_RXSEL(l)) || !rtW(l, kRtFu21MuteL, 1) || !rtW(l, kRtFu21MuteR, 1)) {
             drvFail(43, l, "S43 RX channel select / DAC mute"); return false;
         }
     }
-    for (uint32_t k = 0; k < 2; k++) {   // S44 BE hw_params (intel.c:720-785, 625-675; cadence_master.c:1926-1953)
+    for (uint32_t k = 0; k < AUD_SPK_NDAI; k++) {   // S44 BE hw_params (intel.c:720-785, 625-675; cadence_master.c:1926-1953)
         const AudDrvDai &d = kDrvDai[k];
         uint32_t a = r4(0x2C800 + 4 * d.alh_id);
         a = (a & ~0xFFu & ~(0xFu << 16)) | 0x3u | ((d.ch - 1) << 16);
@@ -3521,15 +3535,15 @@ fail:
 bool AudShim::drvStartSeq() {
     uint64_t o[16];
     uint64_t t0 = nowUs();
-    for (uint32_t l = 1; l <= 2; l++)   // DAPM POST_PMU (rt1316-sdw.c:329-370), still muted
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++)   // DAPM POST_PMU (rt1316-sdw.c:329-370), still muted
         if (!rtW(l, kRtPde23, 0) || !rtW(l, kRtPde27, 0) || !rtW(l, kRtPde22, 0)) { drvFail(60, l, "amps PS0"); return false; }
-    for (uint32_t l = 1; l <= 2; l++) if (!drvProgram(l, 1)) { drvFail(61, l, "BE prepare: params bank 1"); return false; }
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++) if (!drvProgram(l, 1)) { drvFail(61, l, "BE prepare: params bank 1"); return false; }
     if (!drvBank(1)) { drvFail(61, 1, "BE prepare: bank switch to 1"); return false; }
     bzero(m5Va, kM5Buf);   // start from silence (the HAL fills the ring from its first IO cycle on)
     __sync_synchronize();
     if (drvCall(kM5OpStream, 0, 0, o) != kM2Ok) { drvFail(62, o[0], "FE hw_params: host stream"); return false; }
     if (!drvIpc(kDrvPcmParams, false, 0)) { drvFail(63, drvFailCode, "STREAM_PCM_PARAMS"); return false; }
-    for (uint32_t l = 1; l <= 2; l++)
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++)
         if (!drvProgram(l, 0) || !drvPorts(l, 0, true)) { drvFail(64, l, "BE enable: params + ports bank 0"); return false; }
     if (!drvBank(0)) { drvFail(64, 0, "BE enable: bank switch to 0"); return false; }
     for (int tries = 0; tries < 10; tries++) {   // ACTUAL_PS = PS0 on both amps (informational, <= 100 ms)
@@ -3539,7 +3553,7 @@ bool AudShim::drvStartSeq() {
         if (!(a | b | c | d | e | f)) break;
         IOSleep(10);
     }
-    for (uint32_t l = 1; l <= 2; l++)   // DAC switch on (UCM EnableSequence); the PGA is still at 0
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++)   // DAC switch on (UCM EnableSequence); the PGA is still at 0
         if (!rtW(l, kRtFu21MuteL, 0) || !rtW(l, kRtFu21MuteR, 0)) { drvFail(65, l, "DAC switch on"); return false; }
     if (drvCall(kM5OpStream, 1, 0, o) != kM2Ok) { drvFail(66, o[0], "host DMA RUN"); return false; }
     drvRunHost = mach_absolute_time();
@@ -3566,15 +3580,15 @@ bool AudShim::drvStopSeq() {
     drvState = kDrvStBusy;
     if (!drvIpc(kDrvPcmFree, false, 0)) ok = false;
     if (drvCall(kM5OpStream, 3, 0, o) != kM2Ok) ok = false;   // stream hw_free (reset_hw_params_during_stop)
-    for (uint32_t l = 1; l <= 2; l++)   // DAC off + DAPM PRE_PMD
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++)   // DAC off + DAPM PRE_PMD
         if (!rtW(l, kRtFu21MuteL, 1) || !rtW(l, kRtFu21MuteR, 1) || !rtW(l, kRtPde23, 3) || !rtW(l, kRtPde27, 3) ||
             !rtW(l, kRtPde22, 3)) ok = false;
     // sdw_disable_stream + sdw_deprepare_stream (M5 S51/S52 BE part)
-    for (uint32_t l = 1; l <= 2; l++) if (!drvPorts(l, 1, false)) ok = false;
-    for (uint32_t l = 1; l <= 2; l++) if (!drvProgram(l, 1)) ok = false;
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++) if (!drvPorts(l, 1, false)) ok = false;
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++) if (!drvProgram(l, 1)) ok = false;
     if (!drvBank(1)) ok = false;
-    for (uint32_t l = 1; l <= 2; l++) if (!drvPorts(l, 0, false)) ok = false;
-    for (uint32_t l = 1; l <= 2; l++) if (!drvProgram(l, 0)) ok = false;
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++) if (!drvPorts(l, 0, false)) ok = false;
+    for (uint32_t l = AUD_SPK_LINK_FIRST; l <= AUD_SPK_LINK_LAST; l++) if (!drvProgram(l, 0)) ok = false;
     if (!drvBank(0)) ok = false;
     drvState = kDrvStReady;
     IOLog("AudShim DRV: stopped in %llu us%s (xrun notifications %u, DMA errors %u)\n", nowUs() - t0,

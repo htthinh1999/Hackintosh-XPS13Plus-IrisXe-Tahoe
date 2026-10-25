@@ -20,7 +20,7 @@ build)
     [[ -f $TOOLS/AudShim/AudShimData.h ]] || {
         clang -O2 -Wall -Wextra -o $B/audctl $TOOLS/audctl.c -framework IOKit -framework CoreFoundation 2>/dev/null || true
         echo "missing tools/AudShim/AudShimData.h. Generate it from Intel's sof-bin files first:"
-        echo "  tools/build/audctl gen-header tools/AudShim/AudShimData.h --fw=PATH/sof-rpl.ri --tplg=PATH/sof-rpl-rt1316-l12-rt714-l0.tplg"
+        echo "  tools/build/audctl gen-header tools/AudShim/AudShimData.h --fw=PATH/sof-tgl.ri --tplg=PATH/sof-tgl-rt711-l0-rt1316-l1-mono-rt714-l3.tplg"
         exit 1; }
     clang -O2 -Wall -Wextra -o $B/audctl $TOOLS/audctl.c -framework IOKit -framework CoreFoundation
     zsh $TOOLS/build-kext.sh AudShim
