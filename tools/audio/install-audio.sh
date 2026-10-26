@@ -60,6 +60,7 @@ hal)
     I=$(ioreg -r -c AudShim -d 1 2>/dev/null | awk -F'= ' '/"AudShimInterface"/ {print $2}')
     [[ "$I" == "8" || "$I" == "9" ]] || { echo "the loaded AudShim is not interface v8/v9 (got '${I:-none}'): install the kext and reboot first"; exit 1; }
     codesign -v $B/XeSpeakers.driver || { echo "XeSpeakers.driver signature check failed"; exit 1; }
+    sudo mkdir -p /Library/Audio/Plug-Ins/HAL
     sudo rm -rf /Library/Audio/Plug-Ins/HAL/XeSpeakers.driver
     sudo cp -R $B/XeSpeakers.driver /Library/Audio/Plug-Ins/HAL/
     sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/XeSpeakers.driver
