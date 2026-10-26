@@ -1,6 +1,7 @@
 # AudShim port: Dell Latitude 7320 Detachable (Tiger Lake)
 
-Branch `dell7320-tgl`. Stage 1 = internal speakers (tested: 3 tones on both speakers, 0 xruns). Stage 2 = microphones on link 3.
+Branch `dell7320-tgl`. Status: **internal speakers and microphones work in macOS** (System Settings > Sound, any app).
+Not done: the 3.5 mm headset jack (RT711 on link 0, no driver yet).
 
 ## Hardware compared with the XPS 13 Plus 9320
 
@@ -35,6 +36,15 @@ Branch `dell7320-tgl`. Stage 1 = internal speakers (tested: 3 tones on both spea
 - The RT714 register tables are unchanged (Linux uses DMIC3/DMIC4 here too, as on the XPS).
 
 Test: `tools/build/audctl rec /tmp/mic.wav --seconds=5` (talk or clap), expect "REC RESULT: OK".
+
+## XeSpeakers fix: zero time stamp latch
+
+On TGL the host DMA position (DPIB) advances in bursts, so XeSpeakers' clock model, which was corrected and
+reported on every `GetZeroTimeStamp` call, handed CoreAudio a zero time stamp whose host time jittered by tens of
+microseconds within the same ring lap. CoreAudio's raw IO clock then re-anchored every cycle ("Sample time is not
+consecutive"), reported "Overload due to the driver taking too long" and stopped the IO after the first fragment
+(and video players stalled on the audio clock). The model is now sampled once per ring lap and latched, as the HAL
+expects; the same latch is used for the microphones. This is not TGL specific and should be safe upstream.
 
 ## Build and test
 
