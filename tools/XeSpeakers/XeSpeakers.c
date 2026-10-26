@@ -98,6 +98,12 @@ static Float64 gAnchorHost = 0;              // model: host time of unwrapped fr
 static bool gAnchored = false;
 static uint64_t gRunGen = 0;
 static UInt64 gSeed = 1;
+// Zero time stamp latch (Dell 7320 fix): the HAL's raw IO clock needs every zero time stamp to stay identical until
+// the next one (exactly kRingFrames later). The model above is nudged on every call (DPIB moves in DMA bursts on TGL,
+// so the per-call correction jitters by tens of us), which made CoreAudio re-anchor ("sample time is not
+// consecutive") every cycle and overload. The model is now sampled once per ring lap and latched.
+static Float64 gZtsSt = -1; static UInt64 gZtsHt = 0, gZtsSeed = 0;
+static Float64 gMicZtsSt = -1; static UInt64 gMicZtsHt = 0, gMicZtsSeed = 0;
 // DEBUG (Dell 7320 port): log the speaker clock model and the first IO cycles after every START
 static volatile int gDbgZ = 1000, gDbgW = 1000;
 static volatile uint64_t gDbgP[4]; static volatile int gDbgPosOk = -1;
@@ -868,8 +874,16 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID dev
     Float64 now = (Float64)XS_NOW();
     Float64 cur = (now - gAnchorHost) / gTicksPerFrame;
     Float64 laps = cur > 0 ? floor(cur / kRingFrames) : 0;
-    *st = laps * kRingFrames;
-    *ht = (UInt64)(gAnchorHost + laps * kRingFrames * gTicksPerFrame);
+    Float64 nst = laps * kRingFrames;
+    if (gZtsSeed != gSeed || gZtsSt < 0 || nst < gZtsSt) {          // new timeline (START / discontinuity)
+        gZtsSt = nst; gZtsHt = (UInt64)(gAnchorHost + nst * gTicksPerFrame); gZtsSeed = gSeed;
+    } else if (nst > gZtsSt) {                                       // next lap(s): sample the model once
+        UInt64 h = (UInt64)(gAnchorHost + nst * gTicksPerFrame);
+        if (h <= gZtsHt) h = gZtsHt + (UInt64)((nst - gZtsSt) * gTicksPerFrame);
+        gZtsSt = nst; gZtsHt = h;
+    }
+    *st = gZtsSt;
+    *ht = gZtsHt;
     *seed = gSeed;
     if (gDbgZ < 80) {
         gDbgZ++;
@@ -1016,8 +1030,16 @@ static OSStatus micZeroTimeStamp(Float64 *st, UInt64 *ht, UInt64 *seed) {
     Float64 now = (Float64)XS_NOW();
     Float64 cur = (now - gMicAnchorHost) / gTicksPerFrame;
     Float64 laps = cur > 0 ? floor(cur / kRingFrames) : 0;
-    *st = laps * kRingFrames;
-    *ht = (UInt64)(gMicAnchorHost + laps * kRingFrames * gTicksPerFrame);
+    Float64 nst = laps * kRingFrames;
+    if (gMicZtsSeed != gMicSeed || gMicZtsSt < 0 || nst < gMicZtsSt) {
+        gMicZtsSt = nst; gMicZtsHt = (UInt64)(gMicAnchorHost + nst * gTicksPerFrame); gMicZtsSeed = gMicSeed;
+    } else if (nst > gMicZtsSt) {
+        UInt64 h = (UInt64)(gMicAnchorHost + nst * gTicksPerFrame);
+        if (h <= gMicZtsHt) h = gMicZtsHt + (UInt64)((nst - gMicZtsSt) * gTicksPerFrame);
+        gMicZtsSt = nst; gMicZtsHt = h;
+    }
+    *st = gMicZtsSt;
+    *ht = gMicZtsHt;
     *seed = gMicSeed;
     return kAudioHardwareNoError;
 }
