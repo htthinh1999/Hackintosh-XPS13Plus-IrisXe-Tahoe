@@ -98,6 +98,9 @@ static Float64 gAnchorHost = 0;              // model: host time of unwrapped fr
 static bool gAnchored = false;
 static uint64_t gRunGen = 0;
 static UInt64 gSeed = 1;
+// DEBUG (Dell 7320 port): log the speaker clock model and the first IO cycles after every START
+static volatile int gDbgZ = 1000, gDbgW = 1000;
+static volatile uint64_t gDbgP[4]; static volatile int gDbgPosOk = -1;
 static Float64 gTicksPerSec = 1e9;
 // the same model for the microphone device, anchored on the capture DMA (separate IO thread)
 static Float64 gMicAnchorHost = 0;
@@ -791,6 +794,8 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 
             // (no volume IPC here: START already ramped the PGA to the last value sent with sendVolume)
             gAnchored = false;
             gSeed++;
+            gDbgZ = 0; gDbgW = 0;
+            os_log_error(gLog, "XSDBG START ok: state %llu bringups %llu, ring %p", o[1], o[11], (void *)gRing);
         }
     }
     if (r == kAudioHardwareNoError) gIOCount++;
@@ -826,10 +831,14 @@ static bool kextPos(uint64_t p[8]) {
 // DMA position -> host-time model (IO thread). DPIB is where the host DMA has read up to in the ring.
 static void clockUpdate(void) {
     uint64_t p[8];
-    if (!XS_POS(p) || p[0] != kDrvStRunning) return;
+    bool posOk = XS_POS(p);
+    gDbgPosOk = posOk ? 1 : 0;
+    if (posOk) { gDbgP[0] = p[0]; gDbgP[1] = p[1]; gDbgP[2] = p[2]; gDbgP[3] = p[3]; }
+    if (!posOk || p[0] != kDrvStRunning) return;
     Float64 t = (Float64)p[2];
     Float64 inRing = (Float64)((uint32_t)p[1] % AUDSHIM_RING_BYTES / AUDSHIM_FRAME_BYTES);
     if (!gAnchored || p[3] != gRunGen) {
+        if (gDbgZ < 80) os_log_error(gLog, "XSDBG anchor: gen %llu -> %llu, DPIB 0x%llx, t %llu, anchor %.0f", gRunGen, p[3], p[1], p[2], t - inRing * gTicksPerFrame);
         gAnchorHost = t - inRing * gTicksPerFrame;
         gRunGen = p[3];
         gAnchored = true;
@@ -862,6 +871,11 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID dev
     *st = laps * kRingFrames;
     *ht = (UInt64)(gAnchorHost + laps * kRingFrames * gTicksPerFrame);
     *seed = gSeed;
+    if (gDbgZ < 80) {
+        gDbgZ++;
+        os_log_error(gLog, "XSDBG zts #%d: st %.0f ht %llu seed %llu | now %.0f anchor %.0f cur %.1f | pos ok %d state %llu DPIB 0x%llx t %llu gen %llu",
+                     gDbgZ, *st, *ht, *seed, now, gAnchorHost, cur, gDbgPosOk, gDbgP[0], gDbgP[1], gDbgP[2], gDbgP[3]);
+    }
     return kAudioHardwareNoError;
 }
 
@@ -901,6 +915,12 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, A
     if (!ring || frames > kRingFrames / 2) return kAudioHardwareNoError;
     const Float32 *src = (const Float32 *)main;
     Float64 t = ci->mOutputTime.mSampleTime;
+    if (gDbgW < 40) {
+        gDbgW++;
+        os_log_error(gLog, "XSDBG write #%d: frames %u out st %.0f ht %llu | cur st %.0f ht %llu | now %llu ring %p",
+                     gDbgW, frames, ci->mOutputTime.mSampleTime, ci->mOutputTime.mHostTime, ci->mCurrentTime.mSampleTime,
+                     ci->mCurrentTime.mHostTime, mach_absolute_time(), (void *)ring);
+    }
     if (t < 0) return kAudioHardwareNoError;
     uint64_t pos = (uint64_t)t % kRingFrames;
     for (UInt32 i = 0; i < frames; i++) {
